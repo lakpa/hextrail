@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hextrail"
+version = "0.1.0"
+description = "Local ARM64 ELF inspection workbench"
+requires-python = ">=3.10"
+dependencies = ["capstone==5.0.9", "pyelftools==0.33", "PySide6-Essentials==6.12.0"]
+
+[project.scripts]
+hextrail = "hextrail.app:main"
+
+[tool.setuptools.packages.find]
+include = ["hextrail*"]
+
+[tool.setuptools.package-data]
+hextrail = ["samples/*.so", "samples/*.c"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
