@@ -7,6 +7,7 @@ The first version is a native Python/Qt desktop application. Using Python gives 
 | File | Responsibility |
 |---|---|
 | `hextrail/engine.py` | ELF validation and metadata, symbols, ASCII strings, virtual-address mapping, call candidates, Capstone disassembly, basic-block graph |
+| `hextrail/decompiler.py` | Provider-neutral, bounded JSON contract for out-of-process decompiler results |
 | `hextrail/app.py` | Background analysis, tables and navigation, graph canvas, hex display, annotation editing, JSON export |
 | `hextrail/storage.py` | Atomic JSON annotation writes keyed by binary digest |
 | `hextrail/samples/` | Benign compiled ARM64 libraries and their C source |
@@ -18,7 +19,17 @@ The original binary is read into memory. All annotations live in a separate file
 
 Capstone supplies instruction decoding, while pyelftools supplies the ELF structure. This is sufficient for a small working inspector with modest setup. It does not provide the function recovery, type propagation or decompiler pipeline expected from IDA Pro. Those are substantial independent analysis tasks.
 
-Ghidra is the proposed next analysis engine because it already provides disassembly, decompilation, scripting and automated workflows. Integration has **not** been implemented in this package.
+Ghidra is the proposed next analysis engine because it already provides disassembly, decompilation, scripting and automated workflows. HexTrail now has a provider-neutral, validated result contract and a bounded headless Ghidra provider. The pseudocode UI and acceptance checks against a real Ghidra installation remain separate phases.
+
+## Decompiler integration phases
+
+The detailed implementation plan and acceptance checklist live in
+[DECOMPILER_PLAN.md](DECOMPILER_PLAN.md).
+
+1. **Result contract — complete.** Validate bounded worker JSON containing the binary digest, provider identity and version, architecture, recovered function boundaries, signatures, pseudocode and warnings. Reject stale, malformed or oversized output before it reaches the UI.
+2. **Ghidra headless provider — implemented; real-Ghidra acceptance pending.** Discover a user-configured Ghidra installation, run it in a temporary project with timeouts and cancellation, and export the contract above. Do not execute code from the inspected binary.
+3. **Pseudocode interface.** Add an explicitly labelled pseudocode view synchronized by function address with disassembly. Show provider/version provenance and analysis warnings.
+4. **Caching and hardening.** Cache by binary digest plus provider/version, isolate the worker, bound resources, preserve structured failures and validate against source-backed and stripped fixtures.
 
 ## Next milestones
 

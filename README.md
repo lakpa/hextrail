@@ -122,11 +122,12 @@ python -m pip install pytest
 QT_QPA_PLATFORM=offscreen python -m pytest -q
 ```
 
-**Verified: 18 tests passed** in the development environment. They cover compiled-binary metadata, virtual-address mapping, a real call target, conditional/loop graph edges, stripped and untyped symbols, malformed/truncated inputs, size limits, cancellation, note persistence, Qt navigation/filtering, clipboard context, export and background loading. Symbol addresses were also checked against GNU `readelf`.
+**Verified: 36 tests passed** in the development environment. They cover compiled-binary metadata, virtual-address mapping, a real call target, conditional/loop graph edges, stripped and untyped symbols, malformed/truncated inputs, size limits, cancellation, note persistence, validated decompiler-result imports, bounded Ghidra process control, Qt navigation/filtering, clipboard context, export and background loading. Symbol addresses were also checked against GNU `readelf`.
 
 Tests that check exact demo addresses use the included fixture, whose original compiler invocation is documented in `samples/README.md`. Rebuilding with a different compiler may change those addresses.
 
 Read [ARCHITECTURE.md](ARCHITECTURE.md) for the extension plan and the path to a Ghidra-backed decompiler.
+The phased implementation and acceptance checklist are in [DECOMPILER_PLAN.md](DECOMPILER_PLAN.md).
 
 ## License
 

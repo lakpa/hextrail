@@ -16,7 +16,7 @@ hextrail = "hextrail.app:main"
 include = ["hextrail*"]
 
 [tool.setuptools.package-data]
-hextrail = ["samples/*.so", "samples/*.c"]
+hextrail = ["samples/*.so", "samples/*.c", "ghidra_scripts/*.java"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
