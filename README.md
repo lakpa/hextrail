@@ -99,7 +99,7 @@ Notes are stored separately at:
 
 This keeps annotations separate from the original library and reuses them when the exact same bytes are opened under another filename. A rebuilt binary with a different digest gets a separate set of notes. Use **Export JSON** to create a portable analysis report with your annotations. JSON report import is not implemented yet.
 
-Existing NativeScope annotations in `~/.nativescope/projects/` are read automatically when no HexTrail annotation file exists for that binary. New saves go to `~/.hextrail/projects/`; the earlier notes are retained. The older `NATIVESCOPE_DATA_DIR` environment variable also remains supported as a fallback.
+Existing HexTrail annotations in `~/.hextrail/projects/` are read automatically when no HexTrail annotation file exists for that binary. New saves go to `~/.hextrail/projects/`; the earlier notes are retained. The older `HEXTRAIL_DATA_DIR` environment variable also remains supported as a fallback.
 
 For an alternative data location:
 
