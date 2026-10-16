@@ -6,15 +6,24 @@ The current engine uses **pyelftools + Capstone**, with a **PySide6/Qt** desktop
 
 ## Start on your Mac
 
-1. Extract `HexTrail-Prototype.zip`.
-2. Open Terminal in the extracted `hextrail` directory.
-3. Run:
+You need **Python 3.10 or newer**. Clone the `main` branch and start the app:
+
+```bash
+git clone --branch main --single-branch https://github.com/lakpa/hextrail.git
+cd hextrail
+bash run.sh
+```
+
+Alternatively, download the repository ZIP from GitHub, extract it, open Terminal
+in the extracted directory, and run:
 
 ```bash
 bash run.sh
 ```
 
-You need **Python 3.10 or newer**. The first run creates a project-local `.venv` and downloads the pinned dependencies. Subsequent launches use the installed dependencies. Close the window to exit.
+The first run creates a project-local `.venv` and downloads the pinned
+dependencies. Subsequent launches use the installed dependencies. Close the
+window to exit.
 
 The included, compiled ARM64 demonstration library opens automatically. This is a source prototype, not a signed or notarised `.app` bundle. The desktop UI and analysis pipeline were tested on Linux with Qt's offscreen renderer; native macOS packaging and a hands-on Mac check remain to be done.
 
@@ -118,6 +127,10 @@ QT_QPA_PLATFORM=offscreen python -m pytest -q
 Tests that check exact demo addresses use the included fixture, whose original compiler invocation is documented in `samples/README.md`. Rebuilding with a different compiler may change those addresses.
 
 Read [ARCHITECTURE.md](ARCHITECTURE.md) for the extension plan and the path to a Ghidra-backed decompiler.
+
+## License
+
+HexTrail is available under the [MIT License](LICENSE).
 
 ## Primary references
 
