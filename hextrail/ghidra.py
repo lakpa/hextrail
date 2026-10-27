@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
+from elftools.common.exceptions import ELFError
+from elftools.elf.elffile import ELFFile
+
 from .decompiler import DecompilationReport, DecompilerError, load_report
 
 
@@ -175,6 +178,10 @@ class GhidraDecompiler:
             "HexTrail",
             "-import",
             str(Path(binary_path).resolve()),
+            "-loader",
+            "ElfLoader",
+            "-loader-imagebase",
+            f"{_elf_image_base(Path(binary_path)):x}",
             "-scriptPath",
             str(self.script_directory),
             "-analysisTimeoutPerFile",
@@ -281,6 +288,24 @@ class GhidraDecompiler:
         return stdout.text(), stderr.text(), int(process.returncode)
 
 
+def _elf_image_base(path: Path) -> int:
+    """Keep Ghidra addresses in the ELF's original link-time address space.
+
+    Ghidra defaults zero-based shared objects to an artificial nonzero base.
+    Explicitly using the lowest PT_LOAD address also preserves nonzero bases
+    in linked executables and prelinked libraries.
+    """
+    try:
+        with path.open("rb") as stream:
+            elf = ELFFile(stream)
+            if elf.num_segments() > 65_536:
+                raise DecompilerError("ELF program-header count exceeds the import limit.")
+            return min((segment["p_vaddr"] for segment in elf.iter_segments()
+                        if segment["p_type"] == "PT_LOAD"), default=0)
+    except (OSError, ELFError) as exc:
+        raise DecompilerError(f"Could not determine the ELF image base: {exc}") from exc
+
+
 def _sha256(path: Path, cancelled: Callable[[], bool]) -> str:
     digest = hashlib.sha256()
     try:
@@ -321,5 +346,7 @@ def _stop_process(process: subprocess.Popen) -> None:
 def _diagnostic(stdout: str, stderr: str) -> str:
     combined = "\n".join(value for value in (stderr, stdout) if value)
     if len(combined) > 4096:
-        return combined[:4096] + "\n[diagnostic truncated]"
+        # Headless startup can fill the beginning of the log before an export
+        # failure is reported. Preserve the end as well as the initial context.
+        return combined[:1024] + "\n[diagnostic truncated]\n" + combined[-3072:]
     return combined

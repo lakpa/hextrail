@@ -1,6 +1,7 @@
 import hashlib
 import os
 import sys
+import struct
 import time
 from pathlib import Path
 
@@ -94,12 +95,32 @@ def test_command_is_argument_list_with_controlled_script_directory(tmp_path):
     assert command[0] == str(provider.installation.analyze_headless)
     assert command[1:3] == [str(project.resolve()), "HexTrail"]
     assert command[command.index("-import") + 1] == str(SAMPLE.resolve())
+    assert command[command.index("-loader") + 1] == "ElfLoader"
+    assert command[command.index("-loader-imagebase") + 1] == "0"
     assert command[command.index("-scriptPath") + 1] == str(provider.script_directory)
     script = command.index("-postScript")
     assert command[script + 1:script + 5] == [
         "HexTrailExport.java", str(report.resolve()), SHA256, "30"
     ]
     assert "-deleteProject" in command
+
+
+def test_command_preserves_nonzero_elf_image_base(tmp_path):
+    home, _ = fake_installation(tmp_path)
+    provider = GhidraDecompiler(discover_ghidra(home))
+    data = bytearray(SAMPLE.read_bytes())
+    struct.pack_into("<H", data, 16, 2)  # ET_EXEC
+    phoff = struct.unpack_from("<Q", data, 32)[0]
+    phentsize, phnum = struct.unpack_from("<HH", data, 54)
+    for index in range(phnum):
+        offset = phoff + index * phentsize
+        if struct.unpack_from("<I", data, offset)[0] == 1:  # PT_LOAD
+            address = struct.unpack_from("<Q", data, offset + 16)[0]
+            struct.pack_into("<Q", data, offset + 16, address + 0x400000)
+    binary = tmp_path / "nonzero-base.elf"
+    binary.write_bytes(data)
+    command = provider.command(binary, tmp_path / "project", tmp_path / "report.json", SHA256)
+    assert command[command.index("-loader-imagebase") + 1] == "400000"
 
 
 def test_fake_headless_provider_imports_validated_report_and_cleans_up(tmp_path):
@@ -143,6 +164,17 @@ def test_missing_report_is_a_structured_error(tmp_path):
 
     with pytest.raises(DecompilerError, match="did not produce"):
         provider.decompile(SAMPLE, SHA256)
+
+
+def test_export_failure_after_long_startup_log_remains_visible(tmp_path):
+    program = "print('startup ' * 1000)\nprint('ERROR: native decompiler is missing')"
+    home, _ = fake_installation(tmp_path, program)
+    provider = GhidraDecompiler(discover_ghidra(home))
+
+    with pytest.raises(DecompilerError, match="native decompiler is missing") as failure:
+        provider.decompile(SAMPLE, SHA256)
+    assert "diagnostic truncated" in str(failure.value)
+    assert len(str(failure.value)) < 5000
 
 
 def test_whole_analysis_timeout_stops_process_and_cleans_up(tmp_path):
