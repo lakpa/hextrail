@@ -20,3 +20,4 @@ hextrail = ["samples/*.so", "samples/*.c", "ghidra_scripts/*.java"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["integration: opt-in acceptance tests requiring a real Ghidra installation"]
