@@ -2,6 +2,8 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import time
+import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -12,6 +14,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 from hextrail.app import MainWindow, STYLE, SAMPLE
 from hextrail.engine import analyse
 from hextrail.storage import AnnotationStore
+from hextrail.decompiler import DecompilationReport, DecompiledFunction, DecompilerError
 
 
 @pytest.fixture(scope="module")
@@ -100,3 +103,206 @@ def test_background_analysis_completes(app, tmp_path):
     assert window.current_fn.name == "calculate_total"
     assert window.open_button.isEnabled()
     window.close()
+
+
+def wait_for(app, predicate):
+    deadline = time.monotonic() + 5
+    while not predicate() and time.monotonic() < deadline:
+        app.processEvents()
+        QTest.qWait(10)
+    app.processEvents()
+    assert predicate(), "Timed out waiting for the Qt worker"
+
+
+@pytest.fixture
+def deep_provider(window, app):
+    """A controllable provider exercises the real Qt thread/signal boundary."""
+    class Provider:
+        def __init__(self):
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.error = None
+            self.received_home = None
+            self.thread_id = None
+            self.result = None
+
+        def factory(self, home):
+            self.received_home = home
+            return self
+
+        def decompile(self, path, sha256, cancelled):
+            self.thread_id = threading.get_ident()
+            self.started.set()
+            while not self.release.wait(0.01):
+                if cancelled():
+                    raise DecompilerError("Decompilation cancelled.")
+            if self.error:
+                raise DecompilerError(self.error)
+            if self.result:
+                return self.result
+            functions = analyse(SAMPLE).functions
+            total = next(f for f in functions if f.name == "calculate_total")
+            local = next(f for f in functions if f.name == "validate_quantity")
+            return DecompilationReport(sha256, "Ghidra", "test-version", "AArch64", (
+                DecompiledFunction(total.address, total.size, total.name,
+                                   "int calculate_total(int quantity, int price)",
+                                   "return quantity * price;", "Ghidra analysis"),
+                DecompiledFunction(local.address, local.size, local.name,
+                                   "int validate_quantity(int quantity)", "", "Ghidra analysis"),
+            ), ("<b>Provider warning: sample only</b>",))
+
+    provider = Provider()
+    window.provider_factory = provider.factory
+    yield provider
+    provider.release.set()
+    if window.deep_worker:
+        window.cancel_deep_analysis()
+        wait_for(app, lambda: window.deep_worker is None)
+
+
+def test_deep_analysis_is_responsive_and_synchronizes_pseudocode(window, app, deep_provider):
+    window.ghidra_home.setText("/chosen/ghidra")
+    window.deep_button.click()
+    wait_for(app, deep_provider.started.is_set)
+    assert deep_provider.thread_id != threading.get_ident()
+    assert deep_provider.received_home == "/chosen/ghidra"
+    assert not window.open_button.isEnabled()
+    assert window.deep_progress.isVisible()
+    # Navigation still responds while the provider is waiting.
+    window.jump_to(next(f.address for f in window.binary.functions if f.name == "checksum_bytes"))
+    assert window.current_fn.name == "checksum_bytes"
+    deep_provider.release.set()
+    wait_for(app, lambda: window.deep_worker is None)
+    assert "No pseudocode matches" in window.pseudocode_view.toPlainText()
+    window.jump_to(next(f.address for f in window.binary.functions if f.name == "calculate_total"))
+    assert window.pseudocode_view.toPlainText() == "return quantity * price;"
+    assert "Ghidra test-version" in window.pseudocode_origin.text()
+    assert "int calculate_total" in window.pseudocode_origin.text()
+    assert "<b>Provider warning" in window.decompiler_warnings.toPlainText()
+    assert window.pseudocode_view.isReadOnly()
+    assert window.open_button.isEnabled()
+    assert not window.deep_progress.isVisible()
+    assert "Completed" in window.deep_status.text()
+
+
+def test_recovered_function_navigation_on_stripped_binary(window, app, deep_provider):
+    window.set_binary(analyse(SAMPLE.with_name("libnative_demo_stripped.so")))
+    assert not any(f.name == "validate_quantity" for f in window.binary.functions)
+    deep_provider.release.set()
+    window.run_deep_analysis()
+    wait_for(app, lambda: window.deep_worker is None)
+    completer = window.recovered_selector.completer()
+    completer.setCompletionPrefix("validate_quantity")
+    assert completer.completionCount() == 1
+    index = next(i for i, f in enumerate(window.recovered_model.rows) if f.name == "validate_quantity")
+    address = window.recovered_model.rows[index].address
+    completer.setCompletionPrefix(f"{address:08x}")
+    assert completer.completionCount() == 1
+    window.recovered_selector.setCurrentIndex(index)
+    window.recovered_selector.activated.emit(index)
+    assert window.tabs.currentWidget() == window.pseudocode_page
+    assert window.current_fn.is_region
+    assert window.pseudocode_address == address
+    assert "validate_quantity" in window.recovered_selector.currentText()
+    assert f"{address:08x}" in window.recovered_selector.currentText()
+    assert "no pseudocode" in window.pseudocode_view.toPlainText()
+    assert "validate_quantity" in window.pseudocode_origin.text()
+    window.pseudocode_assembly.click()
+    assert window.tabs.currentIndex() == 0
+    assert window.assembly_view.currentIndex().data(Qt.ItemDataRole.UserRole).address == address
+    assert window.pseudocode_address == address
+    window.tabs.setCurrentWidget(window.pseudocode_page)
+    assert "validate_quantity" in window.pseudocode_origin.text()
+    # A byte count must not be interpreted as proof of a contiguous function range.
+    window.update_pseudocode(address + 4)
+    assert "No pseudocode matches" in window.pseudocode_view.toPlainText()
+
+
+def test_missing_provider_failure_and_retry(window, app, deep_provider, monkeypatch):
+    from hextrail.app import ghidra_provider
+    import hextrail.app as ui
+
+    def absent(home):
+        raise DecompilerError("Ghidra was not found. Set GHIDRA_HOME.")
+
+    monkeypatch.setattr(ui, "discover_ghidra", absent)
+    window.provider_factory = ghidra_provider
+    window.run_deep_analysis()
+    wait_for(app, lambda: window.deep_worker is None)
+    assert "GHIDRA_HOME" in window.deep_status.text()
+    assert window.decompilation is None
+    assert window.assembly_model.rowCount() == 26
+    assert window.deep_button.isEnabled()
+    window.provider_factory = deep_provider.factory
+    deep_provider.release.set()
+    window.deep_button.click()
+    wait_for(app, lambda: window.deep_worker is None)
+    assert window.decompilation is not None
+
+
+def test_cancellation_preserves_session_and_allows_retry(window, app, deep_provider):
+    window.run_deep_analysis()
+    wait_for(app, deep_provider.started.is_set)
+    original = window.binary
+    # File-menu and drag/drop paths cannot replace the binary while analysis runs.
+    window.load_binary(SAMPLE.with_name("libnative_demo_stripped.so"))
+    assert window.binary is original
+    assert window.worker is None
+    window.deep_cancel.click()
+    wait_for(app, lambda: window.deep_worker is None)
+    assert "cancelled" in window.deep_status.text()
+    assert window.decompilation is None
+    assert window.current_fn.name == "calculate_total"
+    deep_provider.release.set()
+    window.run_deep_analysis()
+    wait_for(app, lambda: window.deep_worker is None)
+    assert window.decompilation is not None
+
+
+@pytest.mark.parametrize("change, message", [
+    ({"binary_sha256": "0" * 64}, "different binary"),
+    ({"architecture": "x86"}, "not for AArch64"),
+])
+def test_mismatched_decompiler_result_is_rejected(window, app, deep_provider, change, message):
+    deep_provider.result = replace(DecompilationReport(
+        window.binary.sha256, "Ghidra", "test", "AArch64", ()), **change)
+    deep_provider.release.set()
+    window.run_deep_analysis()
+    wait_for(app, lambda: window.deep_worker is None)
+    assert message in window.deep_status.text()
+    assert window.decompilation is None
+
+
+def test_failed_rerun_retains_previous_results_and_new_binary_clears_them(window, app, deep_provider):
+    deep_provider.release.set()
+    window.run_deep_analysis()
+    wait_for(app, lambda: window.deep_worker is None)
+    report = window.decompilation
+    deep_provider.release.clear()
+    deep_provider.started.clear()
+    window.run_deep_analysis()
+    wait_for(app, deep_provider.started.is_set)
+    window.cancel_deep_analysis()
+    wait_for(app, lambda: window.deep_worker is None)
+    assert window.decompilation is report
+    assert "Previous results remain displayed" in window.deep_status.text()
+    deep_provider.release.set()
+    deep_provider.error = "Provider process failed"
+    window.run_deep_analysis()
+    wait_for(app, lambda: window.deep_worker is None)
+    assert "Previous results remain displayed" in window.deep_status.text()
+    assert window.decompilation is report
+    assert window.pseudocode_view.toPlainText() == "return quantity * price;"
+    window.load_binary(SAMPLE.with_name("libnative_demo_stripped.so"))
+    wait_for(app, lambda: window.worker is not None and not window.worker.isRunning())
+    assert window.decompilation is None
+    assert window.recovered_model.rowCount() == 0
+    assert not window.decompiler_warnings.isVisible()
+    assert "Run deep analysis" in window.pseudocode_view.toPlainText()
+
+
+def test_close_cancels_deep_analysis_before_destroying_window(window, app, deep_provider):
+    window.run_deep_analysis()
+    wait_for(app, deep_provider.started.is_set)
+    assert not window.close()
+    wait_for(app, lambda: window.deep_worker is None and not window.isVisible())

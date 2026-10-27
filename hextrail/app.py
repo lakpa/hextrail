@@ -16,12 +16,14 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QSplitter, QTabWidget, QTableView, QHeaderView, QAbstractItemView,
     QPlainTextEdit, QFileDialog, QMessageBox, QFrame, QGraphicsView, QGraphicsScene,
-    QGraphicsRectItem, QSizePolicy,
+    QGraphicsRectItem, QSizePolicy, QProgressBar, QComboBox,
 )
 
 from . import __version__
 from .engine import Binary, Function, Instruction, analyse, disassemble, control_flow, ai_context, PAGE_BYTES
 from .storage import AnnotationStore
+from .decompiler import DecompilerError
+from .ghidra import GhidraDecompiler, discover_ghidra
 
 SAMPLE = Path(__file__).parent / "samples" / "libnative_demo.so"
 ACCENT = "#73e3b1"
@@ -40,8 +42,9 @@ QPushButton:pressed { background: #162234; }
 QPushButton:disabled { color: #5b6b7e; border-color: #253247; }
 QPushButton#Primary { background: #73e3b1; color: #10281f; border-color: #73e3b1; font-weight: 700; }
 QPushButton#Primary:hover { background: #94efc9; }
-QLineEdit, QPlainTextEdit { background: #0c121d; border: 1px solid #2b3a50; border-radius: 5px; padding: 7px; selection-background-color: #285949; }
-QLineEdit:focus, QPlainTextEdit:focus { border-color: #73e3b1; }
+QLineEdit, QPlainTextEdit, QComboBox { background: #0c121d; border: 1px solid #2b3a50; border-radius: 5px; padding: 7px; selection-background-color: #285949; }
+QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus { border-color: #73e3b1; }
+QComboBox QLineEdit { border: none; padding: 0; }
 QTabWidget::pane { border: 1px solid #29374c; background: #0e1520; border-radius: 4px; }
 QTabBar::tab { background: #121c2b; color: #92a4bc; padding: 11px 16px; border-bottom: 2px solid transparent; }
 QTabBar::tab:selected { color: #eaf6ff; border-bottom: 2px solid #73e3b1; background: #182538; }
@@ -106,7 +109,7 @@ class Rows(QAbstractTableModel):
         if not index.isValid() or index.row() >= len(self.rows):
             return None
         row = self.rows[index.row()]
-        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole):
+        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole, Qt.ItemDataRole.EditRole):
             return str(self.columns[index.column()][1](row))
         if role == Qt.ItemDataRole.UserRole:
             return row
@@ -160,6 +163,48 @@ class AnalyseWorker(QThread):
             self.ready.emit(analyse(self.path, self.isInterruptionRequested))
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+def ghidra_provider(home):
+    return GhidraDecompiler(discover_ghidra(home))
+
+
+class DecompileWorker(QThread):
+    ready = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal()
+    progress = Signal(str)
+
+    def __init__(self, binary, home, provider_factory, parent=None):
+        super().__init__(parent)
+        self.path = binary.path
+        self.sha256 = binary.sha256
+        self.home = home
+        self.provider_factory = provider_factory
+
+    def run(self):
+        try:
+            self.progress.emit("Preparing Ghidra…")
+            provider = self.provider_factory(self.home)
+            if self.isInterruptionRequested():
+                self.cancelled.emit()
+                return
+            self.progress.emit("Analysing with Ghidra…")
+            report = provider.decompile(self.path, self.sha256, self.isInterruptionRequested)
+            if self.isInterruptionRequested():
+                self.cancelled.emit()
+                return
+            self.progress.emit("Importing decompiler results…")
+            if report.binary_sha256 != self.sha256:
+                raise DecompilerError("Decompiler report belongs to a different binary.")
+            if report.architecture != "AArch64":
+                raise DecompilerError("Decompiler report is not for AArch64.")
+            self.ready.emit(report)
+        except Exception as exc:
+            if self.isInterruptionRequested():
+                self.cancelled.emit()
+            else:
+                self.failed.emit(str(exc))
 
 
 class GraphNode(QGraphicsRectItem):
@@ -262,12 +307,17 @@ class FlowView(QGraphicsView):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, notes_root=None):
+    def __init__(self, notes_root=None, *, provider_factory=ghidra_provider):
         super().__init__()
         self.binary = None
         self.current_fn = None
         self.store = None
         self.worker = None
+        self.deep_worker = None
+        self.decompilation = None
+        self.pseudocode_address = None
+        self.provider_factory = provider_factory
+        self._close_pending = False
         self.page = 0
         self.instructions = []
         self.notes_root = notes_root
@@ -299,6 +349,11 @@ class MainWindow(QMainWindow):
         item.setShortcut(QKeySequence("Ctrl+G"))
         item.triggered.connect(lambda: self.jump_input.setFocus())
         navigate.addAction(item)
+        analysis = self.menuBar().addMenu("Analysis")
+        self.deep_action = QAction("Run deep analysis", self)
+        self.deep_action.setEnabled(False)
+        self.deep_action.triggered.connect(self.run_deep_analysis)
+        analysis.addAction(self.deep_action)
 
     def _build_ui(self):
         root = QWidget()
@@ -453,6 +508,7 @@ class MainWindow(QMainWindow):
         self.details_view = QPlainTextEdit()
         self.details_view.setReadOnly(True)
         self.tabs.addTab(self.details_view, "Details")
+        self._build_pseudocode_ui()
         self.workspace.addWidget(center)
 
         right = QWidget()
@@ -503,6 +559,198 @@ class MainWindow(QMainWindow):
         self.workspace.setSizes([285, 850, 270])
         self.statusBar().showMessage("Ready · Open an ARM64 ELF library or load the included demo")
 
+    def _build_pseudocode_ui(self):
+        self.pseudocode_page = QWidget()
+        layout = QVBoxLayout(self.pseudocode_page)
+        configuration = QHBoxLayout()
+        self.ghidra_home = QLineEdit()
+        self.ghidra_home.setPlaceholderText("Ghidra directory (or use GHIDRA_HOME / PATH)")
+        configuration.addWidget(self.ghidra_home, 1)
+        self.ghidra_browse = button("Browse…", self.choose_ghidra)
+        configuration.addWidget(self.ghidra_browse)
+        layout.addLayout(configuration)
+        controls = QHBoxLayout()
+        self.deep_button = button("Run deep analysis", self.run_deep_analysis)
+        self.deep_button.setEnabled(False)
+        self.deep_cancel = button("Cancel", self.cancel_deep_analysis)
+        self.deep_cancel.setEnabled(False)
+        controls.addWidget(self.deep_button)
+        controls.addWidget(self.deep_cancel)
+        self.deep_progress = QProgressBar()
+        self.deep_progress.setRange(0, 0)
+        self.deep_progress.setTextVisible(False)
+        self.deep_progress.hide()
+        controls.addWidget(self.deep_progress, 1)
+        layout.addLayout(controls)
+        self.deep_status = label("Open a library, then run deep analysis to generate pseudocode.", "Muted", True)
+        self.deep_status.setMaximumHeight(72)
+        self.deep_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.deep_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.deep_status)
+        self.recovered_model = Rows([
+            ("GHIDRA FUNCTION", lambda f: f"{f.name} · {hx(f.address)}"),
+        ])
+        recovered = QHBoxLayout()
+        recovered.addWidget(label("Recovered functions", "Muted"))
+        self.recovered_selector = QComboBox()
+        self.recovered_selector.setEditable(True)
+        self.recovered_selector.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.recovered_selector.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.recovered_selector.setMinimumContentsLength(12)
+        self.recovered_selector.setModel(self.recovered_model)
+        self.recovered_selector.lineEdit().setPlaceholderText("Search names or addresses…")
+        self.recovered_selector.completer().setCompletionRole(Qt.ItemDataRole.DisplayRole)
+        self.recovered_selector.completer().setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.recovered_selector.completer().setFilterMode(Qt.MatchFlag.MatchContains)
+        self.recovered_selector.activated.connect(self.select_recovered_function)
+        recovered.addWidget(self.recovered_selector, 1)
+        layout.addLayout(recovered)
+        self.pseudocode_origin = label("No decompiler result loaded.", "Muted", True)
+        self.pseudocode_origin.setMaximumHeight(80)
+        self.pseudocode_origin.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.pseudocode_origin.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.pseudocode_origin)
+        self.pseudocode_view = QPlainTextEdit()
+        self.pseudocode_view.setReadOnly(True)
+        self.pseudocode_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.pseudocode_view.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.pseudocode_view.setPlainText("Run deep analysis to inspect C-like pseudocode for the selected function.")
+        layout.addWidget(self.pseudocode_view, 1)
+        self.pseudocode_assembly = button("Show function in disassembly", self.show_pseudocode_assembly)
+        self.pseudocode_assembly.setEnabled(False)
+        layout.addWidget(self.pseudocode_assembly)
+        self.decompiler_warnings = QPlainTextEdit()
+        self.decompiler_warnings.setReadOnly(True)
+        self.decompiler_warnings.setMaximumHeight(90)
+        self.decompiler_warnings.hide()
+        layout.addWidget(self.decompiler_warnings)
+        layout.addWidget(label("Generated pseudocode is an interpretation, not original source. Navigation uses function addresses.", "Muted", True))
+        self.tabs.addTab(self.pseudocode_page, "Pseudocode")
+
+    def choose_ghidra(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Ghidra installation", self.ghidra_home.text())
+        if path:
+            self.ghidra_home.setText(path)
+
+    def run_deep_analysis(self):
+        if not self.binary or self.deep_worker or (self.worker and self.worker.isRunning()):
+            return
+        self.tabs.setCurrentWidget(self.pseudocode_page)
+        self.deep_worker = DecompileWorker(
+            self.binary, self.ghidra_home.text().strip() or None, self.provider_factory, self)
+        self.deep_worker.progress.connect(self.deep_analysis_progress)
+        self.deep_worker.ready.connect(self.deep_analysis_ready)
+        self.deep_worker.failed.connect(self.deep_analysis_failed)
+        self.deep_worker.cancelled.connect(self.deep_analysis_cancelled)
+        self.deep_worker.finished.connect(self.deep_analysis_finished)
+        self._deep_controls(True)
+        self.deep_status.setText("Preparing Ghidra…")
+        self.deep_status.setToolTip("")
+        self.deep_worker.start()
+
+    def _deep_controls(self, busy):
+        loading = bool(self.worker and self.worker.isRunning())
+        self.deep_button.setEnabled(not busy and not loading and self.binary is not None)
+        self.deep_action.setEnabled(self.deep_button.isEnabled())
+        self.deep_cancel.setEnabled(busy)
+        self.deep_progress.setVisible(busy)
+        self.ghidra_home.setEnabled(not busy)
+        self.ghidra_browse.setEnabled(not busy)
+        self.open_button.setEnabled(not busy and not loading)
+        self.demo_button.setEnabled(not busy and not loading)
+
+    def cancel_deep_analysis(self):
+        if self.deep_worker:
+            self.deep_worker.requestInterruption()
+            self.deep_cancel.setEnabled(False)
+            self.deep_status.setText("Cancelling deep analysis…")
+
+    def deep_analysis_progress(self, message):
+        if self.deep_worker and not self.deep_worker.isInterruptionRequested():
+            self.deep_status.setText(message)
+
+    def deep_analysis_ready(self, report):
+        if not self.deep_worker or self.deep_worker.isInterruptionRequested():
+            return
+        if not self.binary or self.binary.sha256 != report.binary_sha256:
+            self.deep_analysis_failed("Discarded results for a library that is no longer open.")
+            return
+        self.decompilation = report
+        self.populate_recovered_functions()
+        self.decompiler_warnings.setPlainText("Provider warnings:\n" + "\n".join(report.warnings))
+        self.decompiler_warnings.setVisible(bool(report.warnings))
+        self.update_pseudocode(self.pseudocode_address)
+        self.deep_status.setText(
+            f"Completed · {report.provider} {report.provider_version} · "
+            f"{len(report.functions):,} functions · {len(report.warnings):,} warning(s)")
+
+    def deep_analysis_failed(self, message):
+        suffix = " Previous results remain displayed." if self.decompilation else ""
+        self.deep_status.setText(f"Deep analysis failed: {message}{suffix}")
+        self.deep_status.setToolTip(message)
+
+    def deep_analysis_cancelled(self):
+        suffix = " Previous results remain displayed." if self.decompilation else ""
+        self.deep_status.setText("Deep analysis cancelled." + suffix)
+
+    def deep_analysis_finished(self):
+        worker = self.deep_worker
+        if worker and worker.isInterruptionRequested():
+            self.deep_analysis_cancelled()
+        self.deep_worker = None
+        self._deep_controls(False)
+        if worker:
+            worker.deleteLater()
+        if self._close_pending:
+            QTimer.singleShot(0, self.close)
+
+    def populate_recovered_functions(self):
+        self.recovered_model.replace(list(self.decompilation.functions) if self.decompilation else [])
+        self.recovered_selector.setCurrentIndex(-1)
+        self.recovered_selector.clearEditText()
+
+    def select_recovered_function(self, index):
+        function = self.recovered_model.index(index, 0).data(Qt.ItemDataRole.UserRole)
+        if function and self.save_notes():
+            self.jump_to(function.address)
+            self.update_pseudocode(function.address)
+            self.tabs.setCurrentWidget(self.pseudocode_page)
+
+    def update_pseudocode(self, address=None):
+        self.pseudocode_address = address
+        self.pseudocode_assembly.setEnabled(False)
+        self.pseudocode_origin.setToolTip("")
+        report = self.decompilation
+        if not report:
+            self.pseudocode_origin.setText("No decompiler result loaded.")
+            self.pseudocode_view.setPlainText("Run deep analysis to inspect C-like pseudocode for the selected function.")
+            return
+        origin = f"{report.provider} {report.provider_version} · {report.architecture}"
+        # Schema v1 reports body byte counts, not discontiguous address ranges.
+        # Only exact entry addresses establish a reliable function association.
+        index = next((i for i, f in enumerate(report.functions) if f.address == address), -1)
+        function = report.functions[index] if index >= 0 else None
+        self.recovered_selector.setCurrentIndex(index)
+        if not function:
+            self.recovered_selector.clearEditText()
+            self.pseudocode_origin.setText(origin)
+            self.pseudocode_view.setPlainText(
+                "No pseudocode matches this function entry. Select a recovered function above; "
+                "ELF and Ghidra function boundaries may differ.")
+            return
+        self.pseudocode_origin.setText(
+            f"{origin}\n{hx(function.address)} · {function.boundary_source}\n{function.signature or function.name}")
+        self.pseudocode_origin.setToolTip(self.pseudocode_origin.text())
+        self.pseudocode_view.setPlainText(function.pseudocode or
+            "The provider returned no pseudocode for this function. Check the provider warnings below.")
+        self.pseudocode_assembly.setEnabled(self.binary.section_at(function.address) is not None)
+
+    def show_pseudocode_assembly(self):
+        if self.pseudocode_address is not None and self.save_notes():
+            address = self.pseudocode_address
+            self.jump_to(address)
+            self.update_pseudocode(address)
+
     def filtered_page(self, model, placeholder, callback):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -522,6 +770,9 @@ class MainWindow(QMainWindow):
             self.load_binary(path)
 
     def load_binary(self, path):
+        if self.deep_worker:
+            self.statusBar().showMessage("Cancel deep analysis before opening another library.")
+            return
         if self.worker and self.worker.isRunning():
             return
         if not self.save_notes():
@@ -530,6 +781,8 @@ class MainWindow(QMainWindow):
         self.open_button.setEnabled(False)
         self.demo_button.setEnabled(False)
         self.export_button.setEnabled(False)
+        self.deep_button.setEnabled(False)
+        self.deep_action.setEnabled(False)
         self.statusBar().showMessage(f"Analysing {Path(path).name}…")
         self.worker = AnalyseWorker(str(path), self)
         self.worker.ready.connect(self.set_binary)
@@ -542,6 +795,7 @@ class MainWindow(QMainWindow):
         self.open_button.setEnabled(True)
         self.demo_button.setEnabled(True)
         self.export_button.setEnabled(True)
+        self._deep_controls(bool(self.deep_worker))
 
     def analysis_failed(self, message):
         self.statusBar().showMessage(message)
@@ -550,6 +804,14 @@ class MainWindow(QMainWindow):
     def set_binary(self, binary: Binary):
         self.notes_timer.stop()
         self.binary, self.current_fn = binary, None
+        self.decompilation = None
+        self.update_pseudocode()
+        self.populate_recovered_functions()
+        self.decompiler_warnings.clear()
+        self.decompiler_warnings.hide()
+        self.deep_status.setText("Ready · Run deep analysis to generate pseudocode for this library.")
+        self.deep_status.setToolTip("")
+        self._deep_controls(bool(self.deep_worker))
         self.store = AnnotationStore(binary.sha256, self.notes_root)
         self._dirty = False
         name = Path(binary.path).name
@@ -579,7 +841,8 @@ class MainWindow(QMainWindow):
                    "Addresses are link-time virtual addresses. No ASLR load base is applied.",
                    "Strings are printable ASCII, not decoded Java, Kotlin or Dart objects.", "",
                    "LIMITS", *(["• " + w for w in binary.warnings] or ["No additional warnings for this file."]), "",
-                   "This prototype does not decompile, debug, patch, execute or recover original source code.",
+                   "Optional Ghidra deep analysis generates C-like pseudocode in the Pseudocode tab.",
+                   "This prototype does not debug, patch, execute or recover original source code.",
                    "It has no network or AI provider connection. Copy AI context is an explicit clipboard action.",
                    f"Annotation file: {self.store.path}"]
         self.details_view.setPlainText("\n".join(details))
@@ -662,6 +925,7 @@ class MainWindow(QMainWindow):
         self.xrefs_model.replace(refs)
         start = fn.address + page * PAGE_BYTES
         self.set_hex(self.binary.bytes_at(start, min(PAGE_BYTES, max(0, fn.size - page * PAGE_BYTES))), start, "Virtual address")
+        self.update_pseudocode(fn.address)
 
     def change_page(self, delta):
         if self.current_fn:
@@ -674,7 +938,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Enter a hexadecimal virtual address, for example 0x1040.")
 
     def jump_to(self, address):
-        if not self.binary:
+        if not self.binary or not self.save_notes():
             return
         fn = self.binary.function_at(address)
         if not fn:
@@ -688,6 +952,7 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"{hx(address)} does not map to stored bytes in this ELF.")
             return
         self.show_function(fn, (address - fn.address) // PAGE_BYTES)
+        self.update_pseudocode(address if fn.is_region else fn.address)
         self.tabs.setCurrentIndex(0)
         for row, instruction in enumerate(self.instructions):
             if instruction.address <= address < instruction.address + instruction.size:
@@ -792,6 +1057,12 @@ class MainWindow(QMainWindow):
             if choice != QMessageBox.StandardButton.Discard:
                 event.ignore()
                 return
+        if self.deep_worker:
+            self._close_pending = True
+            self.cancel_deep_analysis()
+            self.statusBar().showMessage("Cancelling deep analysis before closing…")
+            event.ignore()
+            return
         if self.worker and self.worker.isRunning():
             self.worker.requestInterruption()
             if not self.worker.wait(2000):
