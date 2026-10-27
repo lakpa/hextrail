@@ -87,11 +87,13 @@ Exit criteria:
 
 ## Phase 2 — Ghidra headless provider
 
-Status: **implementation complete; real-Ghidra acceptance pending**
+Status: **accepted with Ghidra 12.2 on macOS ARM64**
 
 The provider, exporter and deterministic fake-process tests are implemented.
-This development environment does not currently have Ghidra configured, so the
-two fixture-based exit criteria remain open until a real installation is used.
+Both real-Ghidra fixture tests pass using Ghidra 12.2, Temurin JDK 25.0.5 and
+locally built macOS ARM64 native components. Import explicitly preserves the
+ELF image base so provider entries match HexTrail's link-time addresses.
+Other versions and platforms remain unverified.
 
 ### 2.1 Installation discovery
 
@@ -140,7 +142,25 @@ Phase 2 exit criteria:
 
 ## Phase 3 — Pseudocode interface
 
-Status: **planned**
+Status: **accepted with Ghidra 12.2 in offscreen Qt on macOS ARM64**
+
+The real provider was exercised through the Qt worker for stripped-function
+pseudocode, assembly navigation and cancellation with retained earlier results.
+The full suite passes: 48 tests, including the two real-provider acceptance tests.
+
+Implemented in the Qt interface with deterministic provider tests. Use the
+Pseudocode tab to configure a Ghidra directory for the session (or use
+`GHIDRA_HOME` / `PATH`), run/cancel/retry analysis and browse recovered functions.
+Results show provider/version, signature, boundary source and warnings as plain
+text. A separate worker keeps provider discovery and analysis off the UI thread.
+Library replacement is blocked during analysis, and window closing waits
+asynchronously for cancellation and cleanup.
+
+Function synchronization uses exact entry addresses. Recovered entries remain
+separate from ELF functions and use executable-section navigation when symbols
+are missing. Schema v1 does not establish discontiguous body ranges or
+pseudocode-line mappings. Results remain in memory; caching and export are not
+part of this phase.
 
 Deliverables:
 
@@ -247,7 +267,8 @@ Required test groups:
 - Whether cross-references belong in schema v1 or a future schema
 - Cache location and retention policy
 - Whether macOS, Linux and Windows need different cancellation strategies
-- Whether recovered functions should augment or remain separate from ELF symbols
+- Recovered functions currently remain separate from ELF symbols; revisit after
+  the result contract represents complete function-body address ranges
 
 ## Release checklist
 
@@ -257,11 +278,11 @@ Required test groups:
 - [x] Headless export script
 - [x] Bounded process controller
 - [x] Timeout and cancellation cleanup
-- [ ] Source-backed sample acceptance
-- [ ] Stripped sample acceptance
-- [ ] Pseudocode UI
-- [ ] Provenance and warning display
+- [x] Source-backed sample acceptance (Ghidra 12.2 / macOS ARM64)
+- [x] Stripped sample acceptance (Ghidra 12.2 / macOS ARM64)
+- [x] Pseudocode UI with deterministic Qt/provider tests
+- [x] Provenance and warning display
 - [ ] Versioned cache
 - [ ] Cross-platform verification
-- [ ] User documentation
+- [x] Pseudocode setup and opt-in acceptance-test documentation
 

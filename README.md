@@ -25,7 +25,7 @@ The first run creates a project-local `.venv` and downloads the pinned
 dependencies. Subsequent launches use the installed dependencies. Close the
 window to exit.
 
-The included, compiled ARM64 demonstration library opens automatically. This is a source prototype, not a signed or notarised `.app` bundle. The desktop UI and analysis pipeline were tested on Linux with Qt's offscreen renderer; native macOS packaging and a hands-on Mac check remain to be done.
+The included, compiled ARM64 demonstration library opens automatically. This is a source prototype, not a signed or notarised `.app` bundle. The desktop UI and analysis pipeline have been checked with Qt's offscreen renderer on macOS ARM64, including real Ghidra 12.2 decompilation. Native macOS packaging and a hands-on interactive Mac check remain to be done.
 
 To open one of your own libraries at launch:
 
@@ -59,6 +59,8 @@ On Windows, use `py -m venv .venv`, then `.venv\Scripts\python -m pip install -r
 | Imports | Search undefined dynamic symbols, including Android API imports |
 | Hex view | Inspect bytes using an explicitly labelled address or file-offset basis |
 | Notes and aliases | Automatic local saving, scoped to the exact binary's SHA-256 |
+| Optional deep analysis | User-installed Ghidra runs locally in the background, with cancellation and retry |
+| Pseudocode | Read-only C-like output, searchable recovered functions, function-address navigation and provider warnings |
 | JSON export | Metadata, functions, strings, call candidates, annotations and coverage notes |
 | Copy AI context | Copies a grounded prompt plus the selected disassembly page to the clipboard |
 
@@ -77,17 +79,47 @@ On Windows, use `py -m venv .venv`, then `.venv\Scripts\python -m pip install -r
 
 These demos are small, benign analysis fixtures. The original C source is included. The logging import is deliberately unresolved in the freestanding build; the sample is provided for static inspection, not installation as an Android application.
 
+## Optional Ghidra pseudocode
+
+The built-in inspector works without Ghidra. For deeper analysis:
+
+1. Install [Ghidra](https://github.com/NationalSecurityAgency/ghidra) and the JDK required by that release, following its installation instructions. HexTrail does not download or bundle either.
+2. Open a supported library and select **Pseudocode**.
+3. Use **Browse…** to choose the extracted Ghidra installation directory. Alternatively, set `GHIDRA_HOME` before launching HexTrail or put `analyzeHeadless` on `PATH`. The directory selected in the UI applies to the current session.
+4. Click **Run deep analysis** (also available in the **Analysis** menu). The UI shows analysis stages and remains available for navigation. **Cancel** stops the worker; failures and cancellations can be retried.
+5. Selecting an ELF function displays pseudocode when its entry address matches a Ghidra function. Search by name or address in the **Recovered functions** selector to inspect entries missing from ELF symbols, then choose a result. **Show function in disassembly** navigates to its entry address.
+
+The view identifies the provider/version, signature and boundary source, and displays provider warnings as plain text. Empty pseudocode is explained explicitly. Navigation operates at function-entry level; schema v1 does not provide pseudocode-line mappings or discontiguous function-body ranges. Recovered functions remain in their own selector rather than replacing ELF symbols. On stripped binaries the assembly inspector may therefore show the containing executable section, and annotations continue to use that inspector's selected entry.
+
+Opening another library requires finishing or cancelling deep analysis. Closing the window cancels active deep analysis before closing. A failed or cancelled rerun retains earlier results for the same binary; opening another binary clears them. Decompiler results are currently held in memory and are not included in JSON exports or saved across launches; versioned caching is the next phase.
+
+**Verified with Ghidra 12.2 on macOS ARM64:** both sample libraries produce pseudocode at their original ELF addresses, including the stripped local function. The real provider was also exercised through the offscreen Qt interface for pseudocode/assembly navigation and cancellation. Other Ghidra versions and operating systems still need acceptance checks.
+
+### Configured local checkout
+
+This development checkout has Ghidra 12.2, Temurin JDK 25.0.5 for ARM64 and a native Python environment under the Git-ignored `.tools/` directory. The Ghidra and JDK archives were verified against their published SHA-256 checksums. Installation metadata is in `.tools/installation.json`.
+
+`bash run.sh` loads `.tools/activate.sh` when present and uses `.tools/python` when available. The activation file sets the local Ghidra/JDK paths and keeps Ghidra settings and caches inside `.tools/`. Edit that file to change this checkout's installation. These files are local to this checkout and are not included when cloning the repository.
+
+Ghidra 12.2 requires JDK 25 and a native-component build on macOS; see the [release installation instructions](https://github.com/NationalSecurityAgency/ghidra/blob/Ghidra_12.2_build/GhidraDocs/GettingStarted.md#building-native-components). After setting up the tools and sourcing the activation file, the native build can be repeated with:
+
+```bash
+source .tools/activate.sh
+GRADLE_USER_HOME="$PWD/.tools/gradle-cache" "$GHIDRA_HOME/support/gradle/gradlew" \
+  -p "$GHIDRA_HOME/support/gradle" --no-daemon buildNatives
+```
+
 ## Interpretation and limits
 
 - Inputs must be little-endian **ELF64 / AArch64** linked libraries or executables with section headers, up to **128 MiB**. The first version rejects 32-bit ARM, x86, PE, Mach-O, relocatable object files, compressed sections and sectionless binaries.
 - AArch64 ELF does not itself establish Android compatibility. The loader accepts other AArch64 ELF libraries too.
-- Function names and boundaries come from symbol tables. Zero-sized symbol extents are estimated and labelled. A stripped library can expose only its exported functions; an unnamed executable region is **not** a recovered function.
+- Built-in function names and boundaries come from symbol tables. Zero-sized symbol extents are estimated and labelled. Built-in inspection of a stripped library can expose only its exported functions; an unnamed executable region is **not** a recovered function. Optional Ghidra results are displayed separately.
 - Addresses are **link-time virtual addresses**, not file offsets or runtime ASLR addresses. Android's runtime load base is not applied.
 - The direct-call index scans aligned `BL` encodings in at most **8 MiB** of executable bytes. Embedded data can create false candidates. Indirect calls, tail calls and final PLT/import targets are not resolved. The Details tab and JSON export expose coverage.
 - Each disassembly/graph page contains at most **4 KiB**. A page boundary can cut across a function or basic block. Only edges with targets on the current page appear in the graph.
 - Strings are ASCII only, capped at **12,000** entries and **512** displayed characters per string. The symbol-table limit is 100,000 entries.
-- This is not a decompiler or debugger. It cannot recover original C/C++, Java, Kotlin or Dart source, handle Dart AOT snapshots semantically, analyse obfuscation reliably, or determine that a call is a vulnerability.
-- Qt displays and parses files locally. This prototype does not execute or patch the inspected binary. File parsing runs in a background thread, not a hardened sandbox.
+- Built-in inspection does not decompile; optional Ghidra analysis produces interpreted C-like pseudocode. This is not a debugger and cannot recover original C/C++, Java, Kotlin or Dart source, handle Dart AOT snapshots semantically, analyse obfuscation reliably, or determine that a call is a vulnerability.
+- Qt displays and parses files locally. This prototype does not execute or patch the inspected binary. Built-in parsing runs in a background thread; Ghidra runs in a separate process. Neither is a hardened sandbox.
 
 ## Saved work
 
@@ -122,7 +154,24 @@ python -m pip install pytest
 QT_QPA_PLATFORM=offscreen python -m pytest -q
 ```
 
-**Verified: 36 tests passed** in the development environment. They cover compiled-binary metadata, virtual-address mapping, a real call target, conditional/loop graph edges, stripped and untyped symbols, malformed/truncated inputs, size limits, cancellation, note persistence, validated decompiler-result imports, bounded Ghidra process control, Qt navigation/filtering, clipboard context, export and background loading. Symbol addresses were also checked against GNU `readelf`.
+The default suite covers compiled-binary metadata, virtual-address mapping, a real call target, conditional/loop graph edges, stripped and untyped symbols, malformed/truncated inputs, size limits, cancellation, note persistence, validated decompiler-result imports, bounded Ghidra process control, Qt navigation/filtering, clipboard context, export and background loading. Pseudocode UI tests also cover responsiveness, provider absence, retry, function-address synchronization, stripped-function navigation, report identity/architecture mismatches, retained results after failure, clearing results on library changes and safe closing during analysis.
+
+**Verified: 48 passed, no skips**, including the two real-Ghidra tests, on macOS ARM64 with Python 3.12, Temurin JDK 25.0.5 and Ghidra 12.2. The UI was visually checked with synthetic provider output at 1440×920 and 1050×700 and with real stripped-binary pseudocode at 1440×920. The default suite still skips the real-Ghidra checks unless explicitly enabled.
+
+To run the two real-Ghidra acceptance checks explicitly:
+
+```bash
+GHIDRA_HOME=/absolute/path/to/ghidra HEXTRAIL_TEST_GHIDRA=1 python -m pytest -q -m integration
+```
+
+In this configured checkout, run the complete suite with real Ghidra enabled:
+
+```bash
+source .tools/activate.sh
+HEXTRAIL_TEST_GHIDRA=1 .tools/python/bin/python -m pytest -q
+```
+
+These tests use both supplied samples, check pseudocode at known function entries (including the stripped local function), verify provider identity/version and check temporary-project cleanup. They are skipped in the default suite and do not install Ghidra. Passing them checks the sample workflow, not general decompilation fidelity.
 
 Tests that check exact demo addresses use the included fixture, whose original compiler invocation is documented in `samples/README.md`. Rebuilding with a different compiler may change those addresses.
 
