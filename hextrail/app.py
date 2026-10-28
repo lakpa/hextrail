@@ -22,8 +22,8 @@ from PySide6.QtWidgets import (
 from . import __version__
 from .engine import Binary, Function, Instruction, analyse, disassemble, control_flow, ai_context, PAGE_BYTES
 from .storage import AnnotationStore
-from .decompiler import DecompilerError
 from .ghidra import GhidraDecompiler, discover_ghidra
+from .cache import AnalysisCache, AnalysisResult, run_analysis
 
 SAMPLE = Path(__file__).parent / "samples" / "libnative_demo.so"
 ACCENT = "#73e3b1"
@@ -174,32 +174,35 @@ class DecompileWorker(QThread):
     failed = Signal(str)
     cancelled = Signal()
     progress = Signal(str)
+    cleared = Signal(int)
 
-    def __init__(self, binary, home, provider_factory, parent=None):
+    def __init__(self, binary, home, provider_factory, cache, operation, parent=None):
         super().__init__(parent)
         self.path = binary.path
         self.sha256 = binary.sha256
         self.home = home
         self.provider_factory = provider_factory
+        self.cache = cache
+        self.operation = operation
 
     def run(self):
         try:
-            self.progress.emit("Preparing Ghidra…")
+            if self.operation == "clear":
+                self.progress.emit("Clearing saved analysis…")
+                self.cleared.emit(self.cache.clear(self.sha256, self.isInterruptionRequested))
+                return
+            self.progress.emit("Checking analysis provider…")
             provider = self.provider_factory(self.home)
             if self.isInterruptionRequested():
                 self.cancelled.emit()
                 return
-            self.progress.emit("Analysing with Ghidra…")
-            report = provider.decompile(self.path, self.sha256, self.isInterruptionRequested)
+            result = run_analysis(provider, self.path, self.sha256, self.cache,
+                force=self.operation == "rerun", cache_only=self.operation == "restore",
+                cancelled=self.isInterruptionRequested, progress=self.progress.emit)
             if self.isInterruptionRequested():
                 self.cancelled.emit()
                 return
-            self.progress.emit("Importing decompiler results…")
-            if report.binary_sha256 != self.sha256:
-                raise DecompilerError("Decompiler report belongs to a different binary.")
-            if report.architecture != "AArch64":
-                raise DecompilerError("Decompiler report is not for AArch64.")
-            self.ready.emit(report)
+            self.ready.emit(result)
         except Exception as exc:
             if self.isInterruptionRequested():
                 self.cancelled.emit()
@@ -307,7 +310,7 @@ class FlowView(QGraphicsView):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, notes_root=None, *, provider_factory=ghidra_provider):
+    def __init__(self, notes_root=None, *, provider_factory=ghidra_provider, cache_root=None):
         super().__init__()
         self.binary = None
         self.current_fn = None
@@ -317,6 +320,8 @@ class MainWindow(QMainWindow):
         self.decompilation = None
         self.pseudocode_address = None
         self.provider_factory = provider_factory
+        self.analysis_cache = AnalysisCache(cache_root)
+        self._restore_cache_pending = False
         self._close_pending = False
         self.page = 0
         self.instructions = []
@@ -582,6 +587,18 @@ class MainWindow(QMainWindow):
         self.deep_progress.hide()
         controls.addWidget(self.deep_progress, 1)
         layout.addLayout(controls)
+        cache_controls = QHBoxLayout()
+        self.deep_rerun = button("Rerun analysis", self.rerun_deep_analysis)
+        self.cache_clear = button("Clear cache", self.clear_analysis_cache)
+        self.deep_rerun.setEnabled(False)
+        self.cache_clear.setEnabled(False)
+        cache_controls.addWidget(self.deep_rerun)
+        cache_controls.addWidget(self.cache_clear)
+        self.cache_status = label("Cache not checked.", "Muted", True)
+        self.cache_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.cache_status.setToolTip(f"Cache directory: {self.analysis_cache.root}")
+        cache_controls.addWidget(self.cache_status, 1)
+        layout.addLayout(cache_controls)
         self.deep_status = label("Open a library, then run deep analysis to generate pseudocode.", "Muted", True)
         self.deep_status.setMaximumHeight(72)
         self.deep_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -633,18 +650,31 @@ class MainWindow(QMainWindow):
             self.ghidra_home.setText(path)
 
     def run_deep_analysis(self):
+        self._start_deep_analysis("normal")
+
+    def rerun_deep_analysis(self):
+        self._start_deep_analysis("rerun")
+
+    def clear_analysis_cache(self):
+        self._start_deep_analysis("clear")
+
+    def _start_deep_analysis(self, operation):
         if not self.binary or self.deep_worker or (self.worker and self.worker.isRunning()):
             return
-        self.tabs.setCurrentWidget(self.pseudocode_page)
+        self._restore_cache_pending = False
+        if operation != "restore":
+            self.tabs.setCurrentWidget(self.pseudocode_page)
         self.deep_worker = DecompileWorker(
-            self.binary, self.ghidra_home.text().strip() or None, self.provider_factory, self)
+            self.binary, self.ghidra_home.text().strip() or None, self.provider_factory,
+            self.analysis_cache, operation, self)
         self.deep_worker.progress.connect(self.deep_analysis_progress)
         self.deep_worker.ready.connect(self.deep_analysis_ready)
         self.deep_worker.failed.connect(self.deep_analysis_failed)
         self.deep_worker.cancelled.connect(self.deep_analysis_cancelled)
+        self.deep_worker.cleared.connect(self.analysis_cache_cleared)
         self.deep_worker.finished.connect(self.deep_analysis_finished)
         self._deep_controls(True)
-        self.deep_status.setText("Preparing Ghidra…")
+        self.deep_status.setText("Clearing saved analysis…" if operation == "clear" else "Checking analysis…")
         self.deep_status.setToolTip("")
         self.deep_worker.start()
 
@@ -652,6 +682,8 @@ class MainWindow(QMainWindow):
         loading = bool(self.worker and self.worker.isRunning())
         self.deep_button.setEnabled(not busy and not loading and self.binary is not None)
         self.deep_action.setEnabled(self.deep_button.isEnabled())
+        self.deep_rerun.setEnabled(self.deep_button.isEnabled())
+        self.cache_clear.setEnabled(self.deep_button.isEnabled())
         self.deep_cancel.setEnabled(busy)
         self.deep_progress.setVisible(busy)
         self.ghidra_home.setEnabled(not busy)
@@ -669,8 +701,16 @@ class MainWindow(QMainWindow):
         if self.deep_worker and not self.deep_worker.isInterruptionRequested():
             self.deep_status.setText(message)
 
-    def deep_analysis_ready(self, report):
+    def deep_analysis_ready(self, result: AnalysisResult):
         if not self.deep_worker or self.deep_worker.isInterruptionRequested():
+            return
+        labels = {"hit": "Cache hit", "miss": "Cache miss", "stored": "Cache miss · saved",
+                  "refreshed": "Cache refreshed", "unavailable": "Result not cached"}
+        self.cache_status.setText(labels[result.cache_status])
+        self.cache_status.setToolTip(f"{result.detail}\nCache directory: {self.analysis_cache.root}")
+        report = result.report
+        if report is None:
+            self.deep_status.setText("No matching saved analysis. Run deep analysis to generate pseudocode.")
             return
         if not self.binary or self.binary.sha256 != report.binary_sha256:
             self.deep_analysis_failed("Discarded results for a library that is no longer open.")
@@ -681,12 +721,21 @@ class MainWindow(QMainWindow):
         self.decompiler_warnings.setVisible(bool(report.warnings))
         self.update_pseudocode(self.pseudocode_address)
         self.deep_status.setText(
-            f"Completed · {report.provider} {report.provider_version} · "
-            f"{len(report.functions):,} functions · {len(report.warnings):,} warning(s)")
+            f"{'Loaded cached analysis' if result.cache_status == 'hit' else 'Completed'} · "
+            f"{report.provider} {report.provider_version} · {len(report.functions):,} functions · "
+            f"{len(report.warnings):,} warning(s) · {result.elapsed_seconds:.2f}s")
+
+    def analysis_cache_cleared(self, count):
+        self.cache_status.setText("Cache cleared")
+        self.cache_status.setToolTip(f"Cache directory: {self.analysis_cache.root}")
+        self.deep_status.setText(
+            f"Removed {count} saved result(s) for this binary. Displayed analysis and notes are unchanged.")
 
     def deep_analysis_failed(self, message):
         suffix = " Previous results remain displayed." if self.decompilation else ""
-        self.deep_status.setText(f"Deep analysis failed: {message}{suffix}")
+        restoring = self.deep_worker and self.deep_worker.operation == "restore"
+        self.deep_status.setText(
+            f"{'Cached analysis could not be restored' if restoring else 'Deep analysis failed'}: {message}{suffix}")
         self.deep_status.setToolTip(message)
 
     def deep_analysis_cancelled(self):
@@ -783,6 +832,8 @@ class MainWindow(QMainWindow):
         self.export_button.setEnabled(False)
         self.deep_button.setEnabled(False)
         self.deep_action.setEnabled(False)
+        self.deep_rerun.setEnabled(False)
+        self.cache_clear.setEnabled(False)
         self.statusBar().showMessage(f"Analysing {Path(path).name}…")
         self.worker = AnalyseWorker(str(path), self)
         self.worker.ready.connect(self.set_binary)
@@ -796,6 +847,9 @@ class MainWindow(QMainWindow):
         self.demo_button.setEnabled(True)
         self.export_button.setEnabled(True)
         self._deep_controls(bool(self.deep_worker))
+        if self._restore_cache_pending:
+            self._restore_cache_pending = False
+            self._start_deep_analysis("restore")
 
     def analysis_failed(self, message):
         self.statusBar().showMessage(message)
@@ -804,6 +858,7 @@ class MainWindow(QMainWindow):
     def set_binary(self, binary: Binary):
         self.notes_timer.stop()
         self.binary, self.current_fn = binary, None
+        self._restore_cache_pending = True
         self.decompilation = None
         self.update_pseudocode()
         self.populate_recovered_functions()
@@ -811,6 +866,8 @@ class MainWindow(QMainWindow):
         self.decompiler_warnings.hide()
         self.deep_status.setText("Ready · Run deep analysis to generate pseudocode for this library.")
         self.deep_status.setToolTip("")
+        self.cache_status.setText("Cache not checked.")
+        self.cache_status.setToolTip(f"Cache directory: {self.analysis_cache.root}")
         self._deep_controls(bool(self.deep_worker))
         self.store = AnnotationStore(binary.sha256, self.notes_root)
         self._dirty = False

@@ -27,7 +27,7 @@ def app():
 
 @pytest.fixture
 def window(app, tmp_path):
-    win = MainWindow(tmp_path)
+    win = MainWindow(tmp_path, cache_root=tmp_path / "cache")
     win.show()
     win.set_binary(analyse(SAMPLE))
     app.processEvents()
@@ -91,7 +91,7 @@ def test_strings_imports_clipboard_and_export(window, app, tmp_path, monkeypatch
 
 
 def test_background_analysis_completes(app, tmp_path):
-    window = MainWindow(tmp_path)
+    window = MainWindow(tmp_path, cache_root=tmp_path / "cache")
     window.show()
     window.load_binary(SAMPLE)
     deadline = time.monotonic() + 10
@@ -101,6 +101,7 @@ def test_background_analysis_completes(app, tmp_path):
     app.processEvents()
     assert window.binary is not None
     assert window.current_fn.name == "calculate_total"
+    wait_for(app, lambda: window.deep_worker is None)
     assert window.open_button.isEnabled()
     window.close()
 
@@ -125,12 +126,20 @@ def deep_provider(window, app):
             self.received_home = None
             self.thread_id = None
             self.result = None
+            self.calls = 0
 
         def factory(self, home):
             self.received_home = home
             return self
 
+        def analysis_profile(self):
+            return {"provider": "Ghidra", "provider_version": "test-version",
+                    "architecture": "AArch64", "language": "auto", "compiler": "auto",
+                    "adapter_revision": "test-v1", "exporter_sha256": "a" * 64,
+                    "options": {"analysis": "default"}}
+
         def decompile(self, path, sha256, cancelled):
+            self.calls += 1
             self.thread_id = threading.get_ident()
             self.started.set()
             while not self.release.wait(0.01):
@@ -241,7 +250,7 @@ def test_missing_provider_failure_and_retry(window, app, deep_provider, monkeypa
 
 
 def test_cancellation_preserves_session_and_allows_retry(window, app, deep_provider):
-    window.run_deep_analysis()
+    window.rerun_deep_analysis()
     wait_for(app, deep_provider.started.is_set)
     original = window.binary
     # File-menu and drag/drop paths cannot replace the binary while analysis runs.
@@ -280,7 +289,7 @@ def test_failed_rerun_retains_previous_results_and_new_binary_clears_them(window
     report = window.decompilation
     deep_provider.release.clear()
     deep_provider.started.clear()
-    window.run_deep_analysis()
+    window.rerun_deep_analysis()
     wait_for(app, deep_provider.started.is_set)
     window.cancel_deep_analysis()
     wait_for(app, lambda: window.deep_worker is None)
@@ -288,7 +297,7 @@ def test_failed_rerun_retains_previous_results_and_new_binary_clears_them(window
     assert "Previous results remain displayed" in window.deep_status.text()
     deep_provider.release.set()
     deep_provider.error = "Provider process failed"
-    window.run_deep_analysis()
+    window.rerun_deep_analysis()
     wait_for(app, lambda: window.deep_worker is None)
     assert "Previous results remain displayed" in window.deep_status.text()
     assert window.decompilation is report
@@ -306,3 +315,73 @@ def test_close_cancels_deep_analysis_before_destroying_window(window, app, deep_
     wait_for(app, deep_provider.started.is_set)
     assert not window.close()
     wait_for(app, lambda: window.deep_worker is None and not window.isVisible())
+
+
+def test_reopening_binary_automatically_restores_cache_without_provider_run(window, app, deep_provider):
+    deep_provider.release.set()
+    window.run_deep_analysis()
+    wait_for(app, lambda: window.deep_worker is None)
+    window.alias_input.setText("saved_name")
+    window.note_editor.setPlainText("Annotations survive cache restore.")
+    assert window.save_notes()
+    expected = window.pseudocode_view.toPlainText()
+    deep_provider.error = "Provider must not run"
+    reopened = MainWindow(window.notes_root, provider_factory=deep_provider.factory,
+                          cache_root=window.analysis_cache.root)
+    try:
+        reopened.show()
+        reopened.load_binary(SAMPLE)
+        wait_for(app, lambda: reopened.decompilation is not None and reopened.deep_worker is None)
+        assert reopened.cache_status.text() == "Cache hit"
+        assert "Loaded cached analysis" in reopened.deep_status.text()
+        assert reopened.pseudocode_view.toPlainText() == expected
+        assert reopened.alias_input.text() == "saved_name"
+        assert "Annotations survive" in reopened.note_editor.toPlainText()
+        assert deep_provider.calls == 1
+    finally:
+        reopened.close()
+        if reopened.deep_worker:
+            wait_for(app, lambda: reopened.deep_worker is None)
+
+
+def test_cache_clear_is_scoped_and_keeps_displayed_results_and_annotations(window, app, deep_provider):
+    deep_provider.release.set()
+    window.run_deep_analysis()
+    wait_for(app, lambda: window.deep_worker is None)
+    report = window.decompilation
+    window.note_editor.setPlainText("Keep this note")
+    assert window.save_notes()
+    stored_notes = window.store.path.read_bytes()
+
+    def unavailable(home):
+        raise AssertionError("Clearing cache must not discover or launch Ghidra")
+
+    window.provider_factory = unavailable
+    window.cache_clear.click()
+    wait_for(app, lambda: window.deep_worker is None)
+    assert window.cache_status.text() == "Cache cleared"
+    assert window.decompilation is report
+    assert window.pseudocode_view.toPlainText() == "return quantity * price;"
+    assert window.store.path.read_bytes() == stored_notes
+    assert not list(window.analysis_cache.root.glob("*.json"))
+    window.provider_factory = deep_provider.factory
+    window.run_deep_analysis()
+    wait_for(app, lambda: window.deep_worker is None)
+    assert deep_provider.calls == 2
+
+
+def test_ui_corrupt_cache_regenerates_and_rerun_bypasses_good_cache(window, app, deep_provider):
+    deep_provider.release.set()
+    window.run_deep_analysis()
+    wait_for(app, lambda: window.deep_worker is None)
+    entry = next(window.analysis_cache.root.glob("*.json"))
+    entry.write_text("incomplete cache write")
+    window.deep_button.click()
+    wait_for(app, lambda: window.deep_worker is None)
+    assert "Cache miss" in window.cache_status.text()
+    assert "ignored" in window.cache_status.toolTip()
+    assert deep_provider.calls == 2
+    window.deep_rerun.click()
+    wait_for(app, lambda: window.deep_worker is None)
+    assert window.cache_status.text() == "Cache refreshed"
+    assert deep_provider.calls == 3
