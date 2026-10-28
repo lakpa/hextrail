@@ -61,6 +61,7 @@ On Windows, use `py -m venv .venv`, then `.venv\Scripts\python -m pip install -r
 | Notes and aliases | Automatic local saving, scoped to the exact binary's SHA-256 |
 | Optional deep analysis | User-installed Ghidra runs locally in the background, with cancellation and retry |
 | Pseudocode | Read-only C-like output, searchable recovered functions, function-address navigation and provider warnings |
+| Analysis cache | Validated saved results, automatic restore, explicit rerun and per-binary removal |
 | JSON export | Metadata, functions, strings, call candidates, annotations and coverage notes |
 | Copy AI context | Copies a grounded prompt plus the selected disassembly page to the clipboard |
 
@@ -91,7 +92,19 @@ The built-in inspector works without Ghidra. For deeper analysis:
 
 The view identifies the provider/version, signature and boundary source, and displays provider warnings as plain text. Empty pseudocode is explained explicitly. Navigation operates at function-entry level; schema v1 does not provide pseudocode-line mappings or discontiguous function-body ranges. Recovered functions remain in their own selector rather than replacing ELF symbols. On stripped binaries the assembly inspector may therefore show the containing executable section, and annotations continue to use that inspector's selected entry.
 
-Opening another library requires finishing or cancelling deep analysis. Closing the window cancels active deep analysis before closing. A failed or cancelled rerun retains earlier results for the same binary; opening another binary clears them. Decompiler results are currently held in memory and are not included in JSON exports or saved across launches; versioned caching is the next phase.
+Opening another library requires finishing or cancelling the current analysis job. Closing the window cancels active deep analysis before closing. A failed or cancelled rerun retains earlier results for the same binary. Opening another binary replaces the displayed results and checks for its matching saved analysis. Decompiler results are now cached across launches; inspection JSON exports still omit pseudocode.
+
+### Saved analysis and cache controls
+
+Opening a library checks for a matching cache entry in the background. A hit restores pseudocode without launching Ghidra; a miss leaves built-in inspection available and waits for an explicit deep-analysis request. **Run deep analysis** reuses a matching entry or runs Ghidra and saves a validated report. **Rerun analysis** bypasses the cache and replaces it only after successful analysis. **Clear cache** removes saved profiles for the currently open binary while keeping displayed results and annotations.
+
+The cache label identifies hits, misses, refreshed entries and unavailable storage. Hover over it for the entry path, saved timestamp/size on hits, or failure details. A cache read/write failure does not prevent fresh analysis from being displayed. Invalid entries are ignored and replaced after successful analysis; interrupted writes are never treated as reports.
+
+Cache identity includes the binary SHA-256, report schema, Ghidra name/version/build metadata, automatic language/compiler selection policy, effective timeout/loader/address options and hashes of the adapter, report validator and export script. A rebuilt input or changed configuration/code therefore gets a different entry. Ghidra must remain configured so its profile/version can be checked; a hit does not require starting Java. Modified third-party Ghidra extensions and other external installation customizations are not fully fingerprinted: use **Rerun analysis** after those changes.
+
+Cache files are separate from notes and original binaries. Configure their directory with `HEXTRAIL_CACHE_DIR`. Otherwise HexTrail uses `$XDG_CACHE_HOME/hextrail/decompilation` when set, `~/Library/Caches/hextrail/decompilation` on macOS, `%LOCALAPPDATA%/HexTrail/cache` on Windows, or `~/.cache/hextrail/decompilation` on other systems. This configured checkout uses `.tools/cache/hextrail/decompilation` through its activation file.
+
+Each report remains bounded to 32 MiB; an entry allows additional bounded metadata. The default completed-entry budget is **512 MiB / 128 entries**, evicting least-recently-used snapshots before publishing new ones. A write can temporarily consume one additional bounded entry; simultaneous application instances can temporarily exceed the budget. Failed writes clean up their temporary file, and abandoned temporary files older than one hour are removed on a later successful write. Cache files are validated local data, not a hardened sandbox or a durable project database.
 
 **Verified with Ghidra 12.2 on macOS ARM64:** both sample libraries produce pseudocode at their original ELF addresses, including the stripped local function. The real provider was also exercised through the offscreen Qt interface for pseudocode/assembly navigation and cancellation. Other Ghidra versions and operating systems still need acceptance checks.
 
@@ -156,7 +169,7 @@ QT_QPA_PLATFORM=offscreen python -m pytest -q
 
 The default suite covers compiled-binary metadata, virtual-address mapping, a real call target, conditional/loop graph edges, stripped and untyped symbols, malformed/truncated inputs, size limits, cancellation, note persistence, validated decompiler-result imports, bounded Ghidra process control, Qt navigation/filtering, clipboard context, export and background loading. Pseudocode UI tests also cover responsiveness, provider absence, retry, function-address synchronization, stripped-function navigation, report identity/architecture mismatches, retained results after failure, clearing results on library changes and safe closing during analysis.
 
-**Verified: 48 passed, no skips**, including the two real-Ghidra tests, on macOS ARM64 with Python 3.12, Temurin JDK 25.0.5 and Ghidra 12.2. The UI was visually checked with synthetic provider output at 1440×920 and 1050×700 and with real stripped-binary pseudocode at 1440×920. The default suite still skips the real-Ghidra checks unless explicitly enabled.
+**Verified: 83 passed, no skips**, including the two real-Ghidra tests, on macOS ARM64 with Python 3.12, Temurin JDK 25.0.5 and Ghidra 12.2. Cache tests cover identity/configuration changes, corruption, bounded reads/storage, interrupted writes, cancellation, failed reruns and removal without touching annotations. Real-Ghidra acceptance also verifies warm reuse with subprocess launching disabled. The real Qt cache workflow was checked across window reopening with notes preserved, and the cache UI was inspected at 1440×920 and 1050×700. The default suite still skips the real-Ghidra checks unless explicitly enabled.
 
 To run the two real-Ghidra acceptance checks explicitly:
 

@@ -8,6 +8,7 @@ The first version is a native Python/Qt desktop application. Using Python gives 
 |---|---|
 | `hextrail/engine.py` | ELF validation and metadata, symbols, ASCII strings, virtual-address mapping, call candidates, Capstone disassembly, basic-block graph |
 | `hextrail/decompiler.py` | Provider-neutral, bounded JSON contract for out-of-process decompiler results |
+| `hextrail/cache.py` | Canonical analysis identities, validated snapshots, atomic writes, eviction and cached-job orchestration |
 | `hextrail/app.py` | Background inspection/decompilation, tables and navigation, graph canvas, pseudocode and hex display, annotation editing, JSON export |
 | `hextrail/storage.py` | Atomic JSON annotation writes keyed by binary digest |
 | `hextrail/samples/` | Benign compiled ARM64 libraries and their C source |
@@ -29,7 +30,7 @@ The detailed implementation plan and acceptance checklist live in
 1. **Result contract — complete.** Validate bounded worker JSON containing the binary digest, provider identity and version, architecture, recovered function boundaries, signatures, pseudocode and warnings. Reject stale, malformed or oversized output before it reaches the UI.
 2. **Ghidra headless provider — accepted with Ghidra 12.2 on macOS ARM64.** Discover a user-configured Ghidra installation, run it in a temporary project with timeouts and cancellation, and export the contract above. Import preserves the ELF image base to retain link-time addresses. Do not execute code from the inspected binary.
 3. **Pseudocode interface — accepted with Ghidra 12.2 in offscreen Qt on macOS ARM64.** Explicit deep-analysis action, off-thread provider discovery and processing, analysis-stage feedback, cancellation/retry, read-only pseudocode, recovered-function filtering and exact function-entry navigation. Show provider/version provenance, signatures, boundary sources and warnings. Deterministic Qt tests exercise worker lifecycle and failure handling.
-4. **Caching and hardening.** Cache by binary digest plus provider/version, isolate the worker, bound resources, preserve structured failures and validate against source-backed and stripped fixtures.
+4. **Caching — implemented as parity milestone M1; broader hardening remains.** Match input/provider/configuration/code identity, validate reads, save atomically and evict bounded stored entries. Restore matching analysis on open; support rerun and removal. Stronger parser/process isolation and large-corpus evaluation remain later work.
 
 ### Pseudocode data flow and limits
 
@@ -52,11 +53,32 @@ The original analysis session remains usable during deep analysis. Library
 replacement is blocked until the worker finishes; close requests cancel and wait
 asynchronously for worker cleanup. Failed/cancelled reruns preserve earlier
 results for that binary. Successful library replacement clears them. Reports
-remain in memory and are not yet cached or included in analysis JSON exports.
+are cached separately from annotations, but are not included in inspection JSON exports.
+
+### Cache data flow
+
+The worker discovers the configured provider without launching it, verifies the
+input file digest and builds an immutable canonical identity from the provider's
+analysis profile. `AnalysisCache` reads a bounded JSON envelope and validates its
+identity, checksum, timestamp and existing report contract. A valid hit returns
+the report without starting Ghidra. A cache-only restore miss never starts it.
+
+Fresh runs and explicit reruns publish only complete validated reports using a
+temporary file, file fsync and atomic replacement. Cache failures are reported
+separately from provider failures: valid fresh analysis remains usable when disk
+storage is unavailable. Eviction reserves space before replacement, preserving
+an earlier entry if the replacement cannot be completed. Notes are never part of
+cache files or cache removal.
+
+The default budget is 512 MiB and 128 completed snapshots. Entry size is bounded
+by the 32 MiB report limit plus bounded metadata. Successful reads update recency;
+oldest managed entries are removed before a new entry is published. Budget
+coordination across simultaneous application instances is best effort. Atomic
+files protect readers from partial writes; this is not a general project database.
 
 ## Next milestones
 
-1. **More complete analysis.** Add versioned caching now that the initial real-Ghidra sample workflow passes. Extend the existing provider contract for function-body ranges, cross-references and types before integrating recovered functions into the main analysis model. Preserve address mapping and provenance. Expand validation to optimization-varied samples and other provider/platform versions.
+1. **More complete analysis.** With M1 caching implemented, proceed to M2: extend the provider contract for function-body ranges, cross-references and types before integrating recovered functions into the main analysis model. Preserve address mapping and provenance. Expand validation to optimization-varied samples and other provider/platform versions.
 2. **Robust local processing.** Move parsers into isolated worker processes with time and memory limits, cancellation and structured failures. Add project/report import, navigation history, bookmarks, search by address, and session recovery.
 3. **Android workflow.** Add safe APK listing and bounded extraction, ABI selection, JNI export/registration mapping, and explicit separation of native ELF analysis from DEX analysis. Treat Flutter/Dart AOT semantics as a separate research feature.
 4. **Optional local AI.** Add an explicitly configured Ollama or MLX endpoint. Supply only selected functions and relevant references; require address citations and distinguish observations from hypotheses. Keep tool execution and binary changes outside the model's direct control. No model is necessary for core analysis.

@@ -159,8 +159,8 @@ asynchronously for cancellation and cleanup.
 Function synchronization uses exact entry addresses. Recovered entries remain
 separate from ELF functions and use executable-section navigation when symbols
 are missing. Schema v1 does not establish discontiguous body ranges or
-pseudocode-line mappings. Results remain in memory; caching and export are not
-part of this phase.
+pseudocode-line mappings. Persistence is handled by the M1 cache in phase 4;
+inspection JSON export still omits pseudocode.
 
 Deliverables:
 
@@ -184,16 +184,25 @@ Phase 3 exit criteria:
 
 ## Phase 4 — Cache and hardening
 
-Status: **planned**
+Status: **cache implemented (M1); broader hardening/evaluation remains planned**
 
 ### Cache
 
-- Key entries by binary SHA-256, provider name, provider version, language and
-  HexTrail report-schema version.
+- Implemented in `hextrail/cache.py`, with atomic bounded JSON snapshots and
+  integration through the existing Qt analysis worker.
+- Key entries by binary SHA-256, provider name/version/build metadata, automatic
+  language/compiler policy, effective analysis options, adapter/validator/exporter
+  source fingerprints and report schema.
 - Store reports separately from annotations and original binaries.
 - Write atomically and validate every cache read.
 - Provide cache inspection and removal controls.
 - Never silently reuse results from a different provider version.
+- Restore matching results on library open without launching Ghidra. A restore
+  miss does not start analysis. Explicit rerun bypasses the entry; per-binary
+  removal keeps displayed results and user annotations.
+- Enforce a default 512 MiB / 128-entry budget with least-recently-used eviction.
+- Verified full suite: 83 tests passed, including real-provider cold/warm results
+  for both fixtures and warm requests with process launching disabled.
 
 ### Isolation and limits
 
@@ -282,7 +291,7 @@ Required test groups:
 - [x] Stripped sample acceptance (Ghidra 12.2 / macOS ARM64)
 - [x] Pseudocode UI with deterministic Qt/provider tests
 - [x] Provenance and warning display
-- [ ] Versioned cache
+- [x] Versioned cache (parity milestone M1)
 - [ ] Cross-platform verification
 - [x] Pseudocode setup and opt-in acceptance-test documentation
 
