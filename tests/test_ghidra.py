@@ -9,6 +9,7 @@ import pytest
 
 from hextrail.decompiler import DecompilerError
 from hextrail.ghidra import GhidraDecompiler, discover_ghidra
+from hextrail.cache import AnalysisCache, CacheIdentity, run_analysis
 
 
 SAMPLE = Path(__file__).parents[1] / "hextrail/samples/libnative_demo.so"
@@ -211,3 +212,31 @@ def test_provider_rejects_report_from_another_ghidra_version(tmp_path):
 
     with pytest.raises(DecompilerError, match="version"):
         provider.decompile(SAMPLE, SHA256)
+
+
+def test_warm_cache_skips_headless_process_and_profile_tracks_exporter_and_options(tmp_path, monkeypatch):
+    home, _ = fake_installation(tmp_path, SUCCESS_PROGRAM)
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    exporter = scripts / "HexTrailExport.java"
+    exporter.write_text("// owned test exporter")
+    installation = discover_ghidra(home)
+    provider = GhidraDecompiler(installation, script_directory=scripts)
+    cache = AnalysisCache(tmp_path / "cache")
+    cold = run_analysis(provider, SAMPLE, SHA256, cache)
+
+    def unexpected(*args):
+        pytest.fail("A valid cache hit launched analyzeHeadless")
+
+    fresh = GhidraDecompiler(installation, script_directory=scripts)
+    monkeypatch.setattr(fresh, "_run", unexpected)
+    warm = run_analysis(fresh, SAMPLE, SHA256, cache)
+    assert warm.cache_status == "hit"
+    assert warm.report == cold.report
+    original = CacheIdentity.create(SHA256, fresh.analysis_profile())
+    exporter.write_text("// revised owned test exporter")
+    assert cache.load(CacheIdentity.create(SHA256, fresh.analysis_profile())) is None
+    exporter.write_text("// owned test exporter")
+    fresh.function_timeout_seconds += 1
+    assert cache.load(CacheIdentity.create(SHA256, fresh.analysis_profile())) is None
+    assert cache.load(original) is not None

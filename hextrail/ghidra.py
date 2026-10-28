@@ -194,6 +194,36 @@ class GhidraDecompiler:
             "-deleteProject",
         ]
 
+    def analysis_profile(self) -> dict:
+        """Fingerprint effective options and owned code without launching Ghidra.
+
+        Language/compiler selection is automatic for the input ELF. Recording
+        that policy, the input digest and provider version makes it reproducible.
+        """
+        try:
+            adapter = hashlib.sha256()
+            for path in (Path(__file__), Path(__file__).with_name("decompiler.py")):
+                adapter.update(path.name.encode("utf-8"))
+                adapter.update(path.read_bytes())
+            exporter = hashlib.sha256((self.script_directory / SCRIPT_NAME).read_bytes()).hexdigest()
+            build = hashlib.sha256(
+                (self.installation.home / "Ghidra" / "application.properties").read_bytes()).hexdigest()
+        except OSError as exc:
+            raise DecompilerError(f"Could not fingerprint the analysis profile: {exc}") from exc
+        return {
+            "provider": self.name, "provider_version": self.installation.version,
+            "architecture": "AArch64", "language": "auto:ELF64-AArch64-little-endian",
+            "compiler": "auto:ELF", "adapter_revision": adapter.hexdigest(),
+            "exporter_sha256": exporter,
+            "options": {
+                "loader": "ElfLoader", "image_base": "original-lowest-PT_LOAD",
+                "timeout_seconds": self.timeout_seconds,
+                "analysis_timeout_seconds": self.analysis_timeout_seconds,
+                "function_timeout_seconds": self.function_timeout_seconds,
+                "provider_build_sha256": build,
+            },
+        }
+
     def decompile(
         self,
         path: str | Path,

@@ -69,6 +69,10 @@ class Decompiler(Protocol):
     @property
     def name(self) -> str: ...
 
+    def analysis_profile(self) -> dict:
+        """Describe provider/version, architecture, configuration and code revisions for caching."""
+        ...
+
     def decompile(
         self,
         path: str | Path,
